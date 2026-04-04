@@ -48,12 +48,18 @@ static bool inline resolve_byname_dev(const char *name, dev_t *out)
 	return true;
 }
 
-struct allow_node { dev_t dev; struct hlist_node h; };
+struct device_hash_node { dev_t dev; struct hlist_node h; };
 DEFINE_HASHTABLE(allowed_devs, 7);
+
+DEFINE_HASHTABLE(blocked_devs, 7);
 
 static bool allow_has(dev_t dev)
 {
-	struct allow_node *p;
+	struct device_hash_node *p;
+
+	hash_for_each_possible(blocked_devs, p, h, (u64)dev) // process blocklist
+		if (p->dev == dev) return false;
+
 	hash_for_each_possible(allowed_devs, p, h, (u64)dev)
 		if (p->dev == dev) return true;
 	return false;
@@ -61,13 +67,24 @@ static bool allow_has(dev_t dev)
 
 static void allow_add(dev_t dev)
 {
-	struct allow_node *n;
+	struct device_hash_node *n;
 	if (!dev || allow_has(dev)) return;
 	n = kmalloc(sizeof(*n), GFP_ATOMIC);
 	if (!n) return;
 	n->dev = dev;
 	hash_add(allowed_devs, &n->h, (u64)dev);
 	bb_pr("allow-cache dev %u:%u\n", MAJOR(dev), MINOR(dev));
+}
+
+static void block_add(dev_t dev)
+{
+	struct device_hash_node *n;
+	if (!dev || allow_has(dev)) return;
+	n = kmalloc(sizeof(*n), GFP_ATOMIC);
+	if (!n) return;
+	n->dev = dev;
+	hash_add(blocked_devs, &n->h, (u64)dev);
+	bb_pr("block-cache dev %u:%u\n", MAJOR(dev), MINOR(dev));
 }
 
 static inline bool is_allowed_partition_dev_resolve(dev_t cur)
@@ -79,11 +96,12 @@ static inline bool is_allowed_partition_dev_resolve(dev_t cur)
 	for (i = 0; i < allowlist_cnt; i++) {
 		const char *n = allowlist_names[i];
 		bool ok = false;
+		char *nm, *na, *nb;
 
 		if (resolve_byname_dev(n, &dev) && dev == cur) return true;
 
-		if (!ok && suf) {
-			char *nm = kasprintf(GFP_ATOMIC, "%s%s", n, suf);
+		if (suf) {
+			nm = kasprintf(GFP_ATOMIC, "%s%s", n, suf);
 			if (nm) {
 				ok = resolve_byname_dev(nm, &dev);
 				kfree(nm);
@@ -91,13 +109,14 @@ static inline bool is_allowed_partition_dev_resolve(dev_t cur)
 			}
 		}
 		if (!ok) {
-			char *na = kasprintf(GFP_ATOMIC, "%s_a", n);
-			char *nb = kasprintf(GFP_ATOMIC, "%s_b", n);
+			na = kasprintf(GFP_ATOMIC, "%s_a", n);
 			if (na) {
 				ok = resolve_byname_dev(na, &dev);
 				kfree(na);
-				if (ok && dev == cur) { if (nb) kfree(nb); return true; }
+				if (ok && dev == cur) return true;
 			}
+			
+			nb = kasprintf(GFP_ATOMIC, "%s_b", n);
 			if (nb) {
 				ok = resolve_byname_dev(nb, &dev);
 				kfree(nb);
@@ -216,24 +235,27 @@ static inline int is_protected_blkdev(struct dentry *dentry)
 {
     struct inode *inode;
 
-    if (!IS_ERR_OR_NULL(dentry))
+    if (IS_ERR_OR_NULL(dentry))
         return 0;
 
-    inode = d_backing_inode(dentry); // fix just rename blkdev to zramxxx bypass
+    inode = d_backing_inode(dentry);
     if (!inode)
         return 0;
 
-    if (unlikely(S_ISBLK(inode->i_mode))) {
+    if (unlikely(S_ISBLK(inode->i_mode))) { // just add blkdevs into blocklist for now, to avoid rename to zramxxx
         if (allow_has(inode->i_rdev) || reverse_allow_match_and_cache(inode->i_rdev))
-            return 0;
+			return 0;
 
-        return 1;
+		// mean we are processing protect devices, add them to blocklist!!! 
+		block_add(inode->i_rdev);
+
+        return 0;
     }
 
 	// there will handle all symlink, to avoid create an symlink -> /dev/block/by-name and modify
     if (unlikely(S_ISLNK(inode->i_mode) && inode->i_op->get_link)) { // fix /dev/block/by-name/xxx rename bypass
 		DEFINE_DELAYED_CALL(done);
-		const char* symlink_target_link = inode->i_op->get_link(dentry, inode, &done);
+		const char* symlink_target_link = vfs_get_link(dentry, &done);
 		int result = 0;
 		struct path target_path;
 
@@ -304,7 +326,7 @@ static int bb_inode_symlink(struct inode *dir, struct dentry *dentry, const char
 static int bb_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
                            struct inode *new_dir, struct dentry *new_dentry)
 {
-    if (!old_dentry)
+    if (IS_ERR_OR_NULL(old_dentry))
         return 0;
 
     if (unlikely(is_protected_blkdev(old_dentry)))
